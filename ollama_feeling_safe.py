@@ -6,8 +6,11 @@ from collections import Counter
 
 MODEL_VERSION = "llama3.2"
 DATASET_PATH = "curated_dataset.jsonl"
+WEAK_REPLIES_PATH = "weak_replies.jsonl"
+SCORE_THRESHOLD = 70
 LAST_REPLY = None
 LAST_PROMPT = None
+LAST_SCORE = None
 
 PERSONA = f"""
 You are a warm, empathetic mentor.
@@ -37,6 +40,42 @@ def load_dataset(path=DATASET_PATH):
 def append_to_dataset(prompt, completion, path=DATASET_PATH):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps({"prompt": prompt, "completion": completion}) + "\n")
+
+
+def append_to_weak(prompt, completion, score, path=WEAK_REPLIES_PATH):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"prompt": prompt, "completion": completion, "score": score}) + "\n")
+
+
+def generate_variations(prompt, corrected):
+    variations = [
+        corrected,
+        corrected.replace("I think", "I believe"),
+        corrected.replace("maybe", "").replace("perhaps", ""),
+    ]
+    variations = [v for v in variations if len(v) > 20]
+    variations = list(set(variations))
+    for v in variations:
+        append_to_dataset(prompt, v)
+
+
+def score_reply(reply):
+    score = 100
+    words = reply.split()
+    if len(words) < 20:
+        score -= 20
+    if len(words) < 10:
+        score -= 15
+    lower = reply.lower()
+    if "i don't know" in lower or "unsure" in lower:
+        score -= 30
+    if "i don't have that information" in lower:
+        score -= 10
+    if any(w in lower for w in ["maybe", "sort of", "perhaps", "kind of"]):
+        score -= 10
+    if reply.endswith("?") or reply.endswith("..."):
+        score -= 5
+    return max(score, 0)
 
 
 def dataset_stats(path=DATASET_PATH):
@@ -89,7 +128,7 @@ def apply_template(user_input):
 
 
 def chat_with_feeling():
-    global LAST_REPLY, LAST_PROMPT
+    global LAST_REPLY, LAST_PROMPT, LAST_SCORE
 
     print("💡 Emotional Ollama Chat Started")
     print(f"   Model: {MODEL_VERSION}  |  Dataset: {DATASET_PATH}")
@@ -120,6 +159,8 @@ def chat_with_feeling():
                 if corrected:
                     append_to_dataset(LAST_PROMPT, corrected)
                     print("✅ Correction saved to dataset.")
+                    generate_variations(LAST_PROMPT, corrected)
+                    print("   Variations generated.")
                     LAST_REPLY = corrected
                 continue
 
@@ -133,11 +174,25 @@ def chat_with_feeling():
                     ],
                 )
                 reply = response["message"]["content"]
-                print("Ollama:", reply)
+                score = score_reply(reply)
+                print(f"Ollama: {reply}  [confidence: {score}/100]")
 
                 LAST_PROMPT = prompt
                 LAST_REPLY = reply
-                append_to_dataset(prompt, reply)
+                LAST_SCORE = score
+
+                if score < SCORE_THRESHOLD:
+                    append_to_weak(prompt, reply, score)
+                    print(f"⚠️  Reply scored {score}/100 — below threshold.")
+                    fix = input("   Correct it? (leave blank to skip, or type correction): ").strip()
+                    if fix:
+                        append_to_dataset(prompt, fix)
+                        print("✅ Correction saved.")
+                        generate_variations(prompt, fix)
+                        print("   Variations generated.")
+                else:
+                    append_to_dataset(prompt, reply)
+
             except Exception:
                 print("⚠️", FALLBACK)
 

@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import shutil
-import subprocess
+import hashlib
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -12,6 +12,7 @@ from collections import Counter
 MODEL_VERSION = "llama3.2"
 DATASET_PATH = "curated_dataset.jsonl"
 WEAK_REPLIES_PATH = "weak_replies.jsonl"
+CACHE_PATH = "knowledge_cache.jsonl"
 GOLD_DIR = "gold"
 SNAPSHOT_DIR = "snapshots"
 SYNC_DIR = None
@@ -19,6 +20,7 @@ SCORE_THRESHOLD = 70
 LAST_REPLY = None
 LAST_PROMPT = None
 LAST_SCORE = None
+RECENT_SCORES = []
 
 EXTERNAL_ENABLED = False
 EXTERNAL_SOURCES = {
@@ -75,6 +77,31 @@ def append_to_weak(prompt, completion, score, path=WEAK_REPLIES_PATH):
         f.write(json.dumps({"prompt": prompt, "completion": completion, "score": score}) + "\n")
 
 
+def query_hash(query):
+    return hashlib.sha256(query.strip().lower().encode()).hexdigest()[:16]
+
+
+def cache_lookup(query):
+    if not os.path.exists(CACHE_PATH):
+        return None
+    qh = query_hash(query)
+    with open(CACHE_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("query_hash") == qh:
+                return entry["results"]
+    return None
+
+
+def cache_store(query, results):
+    entry = {"query_hash": query_hash(query), "query": query, "results": results, "cached_at": datetime.now().isoformat()}
+    with open(CACHE_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def generate_variations(prompt, corrected):
     variations = [
         corrected,
@@ -123,8 +150,34 @@ def topic_distribution(data):
     return topics
 
 
+def chain_personas(names):
+    parts = names.split("+")
+    merged = []
+    for name in parts:
+        p = PERSONAS.get(name.strip())
+        if p:
+            merged.append(p.strip())
+    if not merged:
+        return PERSONAS["mentor"]
+    combined = "\n\n".join(merged)
+    combined += f"\n\nYou are running on {MODEL_VERSION}."
+    return combined
+
+
 def build_persona(data=None, persona_name="mentor"):
-    persona = PERSONAS.get(persona_name, PERSONAS["mentor"])
+    if "+" in persona_name:
+        persona = chain_personas(persona_name)
+    else:
+        persona = PERSONAS.get(persona_name, PERSONAS["mentor"])
+
+    avg_conf = (sum(RECENT_SCORES) / len(RECENT_SCORES)) if RECENT_SCORES else 100
+    if avg_conf < 50:
+        persona += "\nBe cautious and acknowledge uncertainty clearly."
+    elif avg_conf < 70:
+        persona += "\nBalance confidence with openness to correction."
+    else:
+        persona += "\nRespond with strong confidence and clarity."
+
     if data and len(data) >= 3:
         topics = topic_distribution(data)
         total = sum(topics.values()) or 1
@@ -146,9 +199,9 @@ def topic_balance(data):
         return topics
     total = sum(topics.values())
     ideal = total / len(topics)
-    print("   ⚖️  Balance:")
+    print("   \u2696\ufe0f  Balance:")
     for topic, count in topics.most_common():
-        sign = "+" if count >= ideal else "−"
+        sign = "+" if count >= ideal else "\u2212"
         print(f"      {topic}: {count} ({sign}{abs(count - ideal):.0f} vs ideal)")
     return topics
 
@@ -156,54 +209,57 @@ def topic_balance(data):
 def dataset_stats(path=DATASET_PATH):
     data = load_dataset(path)
     if not data:
-        print("📭 Dataset is empty.")
+        print("\U0001f4ad Dataset is empty.")
         return
     topics = topic_balance(data)
-    print(f"📊 Dataset: {len(data)} entries | Model: {MODEL_VERSION}")
+    print(f"\U0001f4ca Dataset: {len(data)} entries | Model: {MODEL_VERSION}")
     for topic, count in topics.most_common():
         print(f"   {topic}: {count}")
+    avg_conf = (sum(RECENT_SCORES) / len(RECENT_SCORES)) if RECENT_SCORES else None
+    if avg_conf is not None:
+        print(f"   Recent avg confidence: {avg_conf:.0f}/100")
 
 
 def validate_dataset(path=DATASET_PATH):
     data = load_dataset(path)
     if not data:
-        print("✅ No entries to validate.")
+        print("\u2705 No entries to validate.")
         return
     issues = 0
     for i, entry in enumerate(data):
         if not isinstance(entry, dict) or "prompt" not in entry or "completion" not in entry:
-            print(f"⚠️  Entry {i}: malformed (missing keys)")
+            print(f"\u26a0\ufe0f  Entry {i}: malformed (missing keys)")
             issues += 1
             continue
         if len(entry["completion"]) < 5:
-            print(f"⚠️  Entry {i}: completion too short")
+            print(f"\u26a0\ufe0f  Entry {i}: completion too short")
             issues += 1
         if "i don't know" in entry["completion"].lower() and len(entry["completion"]) < 20:
-            print(f"⚠️  Entry {i}: uncertain completion without exploration offer")
+            print(f"\u26a0\ufe0f  Entry {i}: uncertain completion without exploration offer")
             issues += 1
     if issues == 0:
-        print("✅ All entries valid.")
+        print("\u2705 All entries valid.")
     else:
-        print(f"⚠️  {issues} issue(s) found. Consider reviewing.")
+        print(f"\u26a0\ufe0f  {issues} issue(s) found. Consider reviewing.")
 
 
 def export_snapshot(path=DATASET_PATH, label=""):
     if not os.path.exists(path):
-        print("⚠️  No dataset to snapshot.")
+        print("\u26a0\ufe0f  No dataset to snapshot.")
         return
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = f"_{label}" if label else ""
     snapshot_path = os.path.join(SNAPSHOT_DIR, f"curated_{timestamp}{suffix}.jsonl")
     shutil.copy2(path, snapshot_path)
-    print(f"📸 Snapshot saved: {snapshot_path}")
+    print(f"\U0001f4f8 Snapshot saved: {snapshot_path}")
     return snapshot_path
 
 
 def export_gold_dataset(path=DATASET_PATH, min_score=90):
     data = load_dataset(path)
     if not data:
-        print("📭 No entries to export.")
+        print("\U0001f4ad No entries to export.")
         return
     os.makedirs(GOLD_DIR, exist_ok=True)
     gold_path = os.path.join(GOLD_DIR, "gold_dataset.jsonl")
@@ -214,14 +270,14 @@ def export_gold_dataset(path=DATASET_PATH, min_score=90):
             if s >= min_score:
                 out.write(json.dumps({"prompt": entry["prompt"], "completion": entry["completion"], "_score": s}) + "\n")
                 count += 1
-    print(f"🥇 Gold dataset exported: {gold_path} ({count} entries, score >= {min_score})")
+    print(f"\U0001f947 Gold dataset exported: {gold_path} ({count} entries, score >= {min_score})")
     return gold_path
 
 
 def sync_dataset(target_dir=None):
     dest = target_dir or SYNC_DIR
     if not dest:
-        print("⚠️  No sync target directory set. Configure SYNC_DIR or pass --sync-dir.")
+        print("\u26a0\ufe0f  No sync target directory set. Configure SYNC_DIR or pass --sync-dir.")
         return
     os.makedirs(dest, exist_ok=True)
     files_to_sync = []
@@ -238,7 +294,32 @@ def sync_dataset(target_dir=None):
     for f in files_to_sync:
         shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
         print(f"   Synced: {os.path.basename(f)}")
-    print(f"📤 Sync complete → {dest}")
+    print(f"\U0001f4e4 Sync complete \u2192 {dest}")
+
+
+def federated_sync(remote_dir):
+    if not os.path.isdir(remote_dir):
+        print(f"\u26a0\ufe0f  Remote dir not found: {remote_dir}")
+        return
+    local_data = load_dataset()
+    remote_path = os.path.join(remote_dir, DATASET_PATH)
+    remote_data = load_dataset(remote_path) if os.path.exists(remote_path) else []
+    seen = {}
+    for entry in local_data + remote_data:
+        key = entry.get("prompt", "")
+        existing = seen.get(key)
+        if existing:
+            existing_score = score_completion(existing.get("completion", ""))
+            current_score = score_completion(entry.get("completion", ""))
+            if current_score > existing_score:
+                seen[key] = entry
+        else:
+            seen[key] = entry
+    merged = list(seen.values())
+    with open(DATASET_PATH, "w", encoding="utf-8") as f:
+        for entry in merged:
+            f.write(json.dumps({"prompt": entry["prompt"], "completion": entry["completion"]}) + "\n")
+    print(f"\U0001f91d Federated merge complete: {len(merged)} entries ({len(local_data)} local + {len(remote_data)} remote)")
 
 
 def fetch_source(source_name, query):
@@ -274,11 +355,17 @@ def fetch_source(source_name, query):
 
 
 def layered_lookup(query):
+    cached = cache_lookup(query)
+    if cached:
+        print("   \U0001f4e1 Cache hit for query")
+        return cached
     results = []
     for source in EXTERNAL_SOURCES:
         result = fetch_source(source, query)
         if result:
             results.append(result)
+    if results:
+        cache_store(query, results)
     return results
 
 
@@ -292,7 +379,7 @@ def apply_template(user_input):
 def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="empathetic-mentor", min_score=80):
     data = load_dataset(path)
     if len(data) < 5:
-        print("⚠️  Need at least 5 dataset entries to train.")
+        print("\u26a0\ufe0f  Need at least 5 dataset entries to train.")
         return
 
     scored = []
@@ -303,11 +390,11 @@ def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="e
     scored.sort(key=lambda x: x["_score"], reverse=True)
     high_quality = [e for e in scored if e["_score"] >= min_score]
     if not high_quality:
-        print(f"⚠️  No entries scored >= {min_score}. Training with top entries anyway.")
+        print(f"\u26a0\ufe0f  No entries scored >= {min_score}. Training with top entries anyway.")
         high_quality = scored[:10]
 
     export_snapshot(path)
-    print(f"🧠 Training '{new_model}' from {base_model} using {len(high_quality)} high-quality examples (score >= {min_score})...")
+    print(f"\U0001f9e0 Training '{new_model}' from {base_model} using {len(high_quality)} high-quality examples (score >= {min_score})...")
 
     few_shot = ""
     for entry in high_quality[:20]:
@@ -328,39 +415,39 @@ Assistant: \"\"\"
         f.write(modelfile)
     try:
         ollama.create(model=new_model, modelfile=modelfile_path)
-        print(f"✅ Model '{new_model}' created. Run it with: ollama run {new_model}")
+        print(f"\u2705 Model '{new_model}' created. Run it with: ollama run {new_model}")
     except Exception as e:
-        print(f"⚠️ Training failed: {e}")
+        print(f"\u26a0\ufe0f Training failed: {e}")
     finally:
         if os.path.exists(modelfile_path):
             os.remove(modelfile_path)
 
 
 def chat_with_feeling(persona_name="mentor"):
-    global LAST_REPLY, LAST_PROMPT, LAST_SCORE
+    global LAST_REPLY, LAST_PROMPT, LAST_SCORE, RECENT_SCORES
 
     data = load_dataset()
     active_persona = build_persona(data, persona_name)
 
-    print(f"💡 Emotional Ollama Chat Started  [persona: {persona_name}]")
+    print(f"\U0001f4a1 Emotional Ollama Chat Started  [persona: {persona_name}]")
     print(f"   Model: {MODEL_VERSION}  |  Dataset: {DATASET_PATH}")
     print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold")
     if EXTERNAL_ENABLED:
-        print(f"   🌐 External knowledge: {', '.join(EXTERNAL_SOURCES)}")
+        print(f"   \U0001f310 External knowledge: {', '.join(EXTERNAL_SOURCES)}")
     try:
         while True:
             user_input = input("You: ")
             cmd = user_input.strip().lower()
 
             if cmd in ["exit", "quit"]:
-                print("👋 Ending session.")
+                print("\U0001f44b Ending session.")
                 break
 
             if cmd == "99":
-                print("📞 Connecting to your empathetic AI assistant...")
+                print("\U0001f4de Connecting to your empathetic AI assistant...")
                 data = load_dataset()
                 active_persona = build_persona(data, persona_name)
-                print(f"   Persona '{persona_name}' adapted to current dataset distribution.")
+                print(f"   Persona '{persona_name}' adapted to dataset and recent confidence ({avg_conf_str(RECENT_SCORES)}).")
                 continue
 
             if cmd == "stats":
@@ -379,7 +466,7 @@ def chat_with_feeling(persona_name="mentor"):
                 corrected = user_input[len("correct"):].strip()
                 if corrected:
                     append_to_dataset(LAST_PROMPT, corrected)
-                    print("✅ Correction saved to dataset.")
+                    print("\u2705 Correction saved to dataset.")
                     generate_variations(LAST_PROMPT, corrected)
                     print("   Variations generated.")
                     LAST_REPLY = corrected
@@ -396,6 +483,9 @@ def chat_with_feeling(persona_name="mentor"):
                 )
                 reply = response["message"]["content"]
                 score = score_reply(reply)
+                RECENT_SCORES.append(score)
+                if len(RECENT_SCORES) > 20:
+                    RECENT_SCORES.pop(0)
                 print(f"Ollama: {reply}  [confidence: {score}/100]")
 
                 LAST_PROMPT = prompt
@@ -408,31 +498,38 @@ def chat_with_feeling(persona_name="mentor"):
                     if external_results:
                         parts = [f"[{source}] {text}" for source, text in external_results]
                         fallback_reply = f"I checked multiple sources:\n" + "\n".join(parts)
-                        print(f"   🌐 Layered results:\n" + "\n".join(parts))
+                        print(f"   \U0001f310 Layered results:\n" + "\n".join(parts))
                         append_to_dataset(prompt, fallback_reply)
                     else:
-                        print(f"⚠️  Score {score}/100 — auto-rejected. Using fallback.")
+                        print(f"\u26a0\ufe0f  Score {score}/100 — auto-rejected. Using fallback.")
                         print("Ollama:", FALLBACK)
                         append_to_dataset(prompt, FALLBACK)
                 elif score < SCORE_THRESHOLD:
                     append_to_weak(prompt, reply, score)
-                    print(f"⚠️  Reply scored {score}/100 — below threshold.")
+                    print(f"\u26a0\ufe0f  Reply scored {score}/100 — below threshold.")
                     fix = input("   Correct it? (leave blank to skip, or type correction): ").strip()
                     if fix:
                         append_to_dataset(prompt, fix)
-                        print("✅ Correction saved.")
+                        print("\u2705 Correction saved.")
                         generate_variations(prompt, fix)
                         print("   Variations generated.")
                 else:
                     if score > 90:
-                        print("   ✅ Auto-approved (score > 90).")
+                        print("   \u2705 Auto-approved (score > 90).")
                     append_to_dataset(prompt, reply)
 
             except Exception:
-                print("⚠️", FALLBACK)
+                print("\u26a0\ufe0f", FALLBACK)
 
     except KeyboardInterrupt:
-        print("\n👋 Session interrupted. Goodbye!")
+        print("\n\U0001f44b Session interrupted. Goodbye!")
+
+
+def avg_conf_str(scores):
+    if not scores:
+        return "no data"
+    avg = sum(scores) / len(scores)
+    return f"avg {avg:.0f}/100"
 
 
 if __name__ == "__main__":
@@ -451,6 +548,9 @@ if __name__ == "__main__":
         elif arg == "--sync-dir" and i + 1 < len(sys.argv):
             sync_target = sys.argv[i + 1]
             i += 2
+        elif arg == "--federated-sync" and i + 1 < len(sys.argv):
+            federated_sync(sys.argv[i + 1])
+            sys.exit(0)
         else:
             rest.append(arg)
             i += 1

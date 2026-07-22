@@ -8,7 +8,7 @@ import urllib.request
 import urllib.parse
 import re
 from datetime import datetime, timedelta
-from collections import Counter
+from collections import Counter, defaultdict
 
 MODEL_VERSION = "llama3.2"
 DATASET_PATH = "curated_dataset.jsonl"
@@ -16,6 +16,7 @@ WEAK_REPLIES_PATH = "weak_replies.jsonl"
 CACHE_PATH = "knowledge_cache.jsonl"
 CONFLICT_PATH = "conflict_queue.jsonl"
 ESCALATION_LOG_PATH = "escalation_log.jsonl"
+WEIGHT_LOG_PATH = "weight_history.jsonl"
 GOLD_DIR = "gold"
 SNAPSHOT_DIR = "snapshots"
 SYNC_DIR = None
@@ -29,6 +30,8 @@ RECENT_SCORES = []
 CONSECUTIVE_LOW = 0
 DYNAMIC_WEIGHTS = {}
 PERSONA_SPEC = "mentor"
+CACHE_HITS = 0
+CACHE_MISSES = 0
 
 EXTERNAL_ENABLED = False
 EXTERNAL_SOURCES = {
@@ -114,21 +117,13 @@ def log_escalation(tier, count, user_input):
         f.write(json.dumps(entry) + "\n")
 
 
-def show_escalation_stats():
-    if not os.path.exists(ESCALATION_LOG_PATH):
-        print("   No escalation events logged.")
-        return
-    tiers = Counter()
-    with open(ESCALATION_LOG_PATH, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            entry = json.loads(line)
-            tiers[entry.get("tier", "?")] += 1
-    print("   \U0001f4ca Escalation stats:")
-    for tier, count in tiers.most_common():
-        print(f"      Tier {tier}: {count} event(s)")
+def log_weights(weights):
+    entry = {
+        "weights": dict(weights),
+        "timestamp": datetime.now().isoformat(),
+    }
+    with open(WEIGHT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 def query_hash(query):
@@ -145,7 +140,9 @@ def freshness_score(source, cached_at_str):
 
 
 def cache_lookup(query):
+    global CACHE_HITS, CACHE_MISSES
     if not os.path.exists(CACHE_PATH):
+        CACHE_MISSES += 1
         return None
     qh = query_hash(query)
     fresh = []
@@ -170,7 +167,9 @@ def cache_lookup(query):
                 f.write(json.dumps(e) + "\n")
     for entry in fresh:
         if entry.get("query_hash") == qh:
+            CACHE_HITS += 1
             return entry["results"]
+    CACHE_MISSES += 1
     return None
 
 
@@ -314,7 +313,6 @@ def build_persona(data=None, persona_name="mentor", dynamic_overrides=None):
         persona = orchestrate_persona(persona_name, dynamic_overrides)
     else:
         persona = PERSONAS.get(persona_name, PERSONAS["mentor"])
-
     avg_conf = (sum(RECENT_SCORES) / len(RECENT_SCORES)) if RECENT_SCORES else 100
     if avg_conf < 50:
         persona += "\nBe cautious and acknowledge uncertainty clearly."
@@ -322,7 +320,6 @@ def build_persona(data=None, persona_name="mentor", dynamic_overrides=None):
         persona += "\nBalance confidence with openness to correction."
     else:
         persona += "\nRespond with strong confidence and clarity."
-
     if data and len(data) >= 3:
         topics = topic_distribution(data)
         total = sum(topics.values()) or 1
@@ -348,6 +345,91 @@ def topic_balance(data):
     return topics
 
 
+def show_cache_stats():
+    if not os.path.exists(CACHE_PATH):
+        print("   \U0001f4e1 Cache: empty")
+        return
+    entries = []
+    with open(CACHE_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    total = len(entries)
+    if total == 0:
+        print("   \U0001f4e1 Cache: empty")
+        return
+    now = datetime.now()
+    freshness_by_source = defaultdict(list)
+    for e in entries:
+        src = e.get("source", "unknown")
+        fs = freshness_score(src, e.get("cached_at", ""))
+        freshness_by_source[src].append(fs)
+    total_queries = CACHE_HITS + CACHE_MISSES
+    hit_rate = (CACHE_HITS / total_queries * 100) if total_queries else 0
+    print(f"   \U0001f4e1 Cache: {total} entries | hits: {CACHE_HITS} | misses: {CACHE_MISSES} | hit rate: {hit_rate:.0f}%")
+    for src, scores in freshness_by_source.items():
+        avg_fs = sum(scores) / len(scores)
+        decay = FRESHNESS_DECAY.get(src, 5)
+        days_until_stale = max(0, (FRESHNESS_STALE_AT - avg_fs) / decay) if decay else 0
+        bar_len = int(avg_fs / 10)
+        bar = "\u2588" * bar_len + "\u2591" * (10 - bar_len)
+        print(f"      {src}: avg freshness {avg_fs:.0f}/100 {bar} (~{days_until_stale:.0f}d until stale)")
+
+
+def show_weight_trends():
+    if not os.path.exists(WEIGHT_LOG_PATH):
+        print("   \U0001f9d0 Weight history: no data yet")
+        return
+    history = []
+    with open(WEIGHT_LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            history.append(json.loads(line))
+    if not history:
+        return
+    names = list(history[0].get("weights", {}).keys())
+    print(f"   \U0001f9d0 Weight trends ({len(history)} snapshots):")
+    for name in names:
+        vals = [h["weights"].get(name, 0) for h in history]
+        recent5 = vals[-5:]
+        direction = "\u2197" if len(vals) > 1 and vals[-1] > vals[0] else "\u2198" if len(vals) > 1 and vals[-1] < vals[0] else "\u2192"
+        avg_val = sum(recent5) / len(recent5)
+        print(f"      {name}: {direction} avg {avg_val:.0f} (last 5: {recent5})")
+
+
+def show_escalation_dashboard():
+    if not os.path.exists(ESCALATION_LOG_PATH):
+        print("   No escalation events logged.")
+        return
+    events = []
+    with open(ESCALATION_LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            events.append(json.loads(line))
+    if not events:
+        print("   \U0001f4ca Escalation dashboard: no events")
+        return
+    tiers = Counter(e.get("tier") for e in events)
+    total_events = len(events)
+    triggers = Counter(e.get("user_input", "")[:30] for e in events)
+    print(f"   \U0001f4ca Escalation dashboard ({total_events} total):")
+    for tier in sorted(tiers):
+        count = tiers[tier]
+        pct = count / total_events * 100
+        label = {1: "external lookup", 2: "persona shift", 3: "hard fallback"}.get(tier, f"tier {tier}")
+        bar = "\u2588" * int(pct / 5) + "\u2591" * (20 - int(pct / 5))
+        print(f"      Tier {tier} ({label}): {count} ({pct:.0f}%) {bar}")
+    print("      Top triggers:")
+    for text, count in triggers.most_common(3):
+        print(f"         \"{text}...\" x{count}")
+
+
 def dataset_stats(path=DATASET_PATH):
     data = load_dataset(path)
     if not data:
@@ -361,7 +443,9 @@ def dataset_stats(path=DATASET_PATH):
     if avg_conf is not None:
         print(f"   Recent avg confidence: {avg_conf:.0f}/100")
         print(f"   Consecutive low: {CONSECUTIVE_LOW}")
-    show_escalation_stats()
+    show_cache_stats()
+    show_weight_trends()
+    show_escalation_dashboard()
 
 
 def show_conflicts():
@@ -377,11 +461,60 @@ def show_conflicts():
             entries.append(json.loads(line))
     entries.sort(key=lambda e: e.get("priority", 30), reverse=True)
     print(f"   \u2697\ufe0f Conflict queue ({len(entries)} total, sorted by priority):")
-    for e in entries[:5]:
+    for i, e in enumerate(entries):
         prompt_preview = e.get("prompt", "")[:60]
         priority = e.get("priority", 30)
         scores = [c.get("score", 0) for c in e.get("completions", [])]
-        print(f"      [{priority}] {prompt_preview}... scores={scores}")
+        print(f"   [{i}] [pri {priority}] {prompt_preview}... scores={scores}")
+    print("   Use: resolve <index> <correction> | resolve-skip <index>")
+
+
+def resolve_conflict(index, correction, path=CONFLICT_PATH):
+    if not os.path.exists(path):
+        print("\u26a0\ufe0f  No conflict queue.")
+        return
+    entries = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    if index < 0 or index >= len(entries):
+        print(f"\u26a0\ufe0f  Invalid index {index}. Valid: 0-{len(entries)-1}")
+        return
+    conflict = entries[index]
+    prompt = conflict["prompt"]
+    append_to_dataset(prompt, correction)
+    print(f"\u2705 Conflict [{index}] resolved. Correction saved to dataset.")
+    entries.pop(index)
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    if correction:
+        generate_variations(prompt, correction)
+        print("   Variations generated.")
+
+
+def skip_conflict(index, path=CONFLICT_PATH):
+    if not os.path.exists(path):
+        print("\u26a0\ufe0f  No conflict queue.")
+        return
+    entries = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    if index < 0 or index >= len(entries):
+        print(f"\u26a0\ufe0f  Invalid index {index}.")
+        return
+    entries.pop(index)
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    print(f"Skipped conflict [{index].")
 
 
 def validate_dataset(path=DATASET_PATH):
@@ -445,14 +578,9 @@ def sync_dataset(target_dir=None):
         return
     os.makedirs(dest, exist_ok=True)
     files_to_sync = []
-    if os.path.exists(DATASET_PATH):
-        files_to_sync.append(DATASET_PATH)
-    if os.path.exists(WEAK_REPLIES_PATH):
-        files_to_sync.append(WEAK_REPLIES_PATH)
-    if os.path.exists(CONFLICT_PATH):
-        files_to_sync.append(CONFLICT_PATH)
-    if os.path.exists(ESCALATION_LOG_PATH):
-        files_to_sync.append(ESCALATION_LOG_PATH)
+    for f in [DATASET_PATH, WEAK_REPLIES_PATH, CONFLICT_PATH, ESCALATION_LOG_PATH, WEIGHT_LOG_PATH]:
+        if os.path.exists(f):
+            files_to_sync.append(f)
     snapshot = export_snapshot()
     if snapshot:
         files_to_sync.append(snapshot)
@@ -480,10 +608,7 @@ def federated_sync(remote_dir, merge_policy="highest"):
         if existing:
             existing_score = score_completion(existing.get("completion", ""))
             current_score = score_completion(entry.get("completion", ""))
-            if merge_policy == "keep-both":
-                conflicts.append((key, existing["completion"], existing_score, entry["completion"], current_score))
-                continue
-            elif merge_policy == "manual":
+            if merge_policy in ("keep-both", "manual"):
                 conflicts.append((key, existing["completion"], existing_score, entry["completion"], current_score))
                 continue
             else:
@@ -579,7 +704,6 @@ def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="e
     if len(data) < 5:
         print("\u26a0\ufe0f  Need at least 5 dataset entries to train.")
         return
-
     scored = []
     for entry in data:
         s = score_completion(entry["completion"])
@@ -590,14 +714,11 @@ def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="e
     if not high_quality:
         print(f"\u26a0\ufe0f  No entries scored >= {min_score}. Training with top entries anyway.")
         high_quality = scored[:10]
-
     export_snapshot(path)
     print(f"\U0001f9e0 Training '{new_model}' from {base_model} using {len(high_quality)} high-quality examples (score >= {min_score})...")
-
     few_shot = ""
     for entry in high_quality[:20]:
         few_shot += f"User: {entry['prompt']}\nAssistant: {entry['completion']}\n\n"
-
     data = load_dataset(path)
     persona = build_persona(data)
     modelfile = f"""FROM {base_model}
@@ -644,7 +765,6 @@ def handle_escalation_tier(count, user_input, prompt):
 def chat_with_feeling(persona_name="mentor"):
     global LAST_REPLY, LAST_PROMPT, LAST_SCORE, RECENT_SCORES, CONSECUTIVE_LOW, DYNAMIC_WEIGHTS, PERSONA_SPEC
     PERSONA_SPEC = persona_name
-
     parts = persona_name.split("+")
     DYNAMIC_WEIGHTS = {}
     for part in parts:
@@ -655,13 +775,11 @@ def chat_with_feeling(persona_name="mentor"):
             name = p
         if name in PERSONAS:
             DYNAMIC_WEIGHTS[name] = 50
-
     data = load_dataset()
     active_persona = build_persona(data, persona_name)
-
     print(f"\U0001f4a1 Emotional Ollama Chat Started  [persona: {persona_name}]")
     print(f"   Model: {MODEL_VERSION}  |  Dataset: {DATASET_PATH}")
-    print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold | conflicts")
+    print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold | conflicts | resolve <i> <text> | resolve-skip <i>")
     if EXTERNAL_ENABLED:
         print(f"   \U0001f310 External: {', '.join(EXTERNAL_SOURCES)} | Cache freshness score < {FRESHNESS_STALE_AT} = stale")
         print(f"   Escalation tiers: 3\u2192external  5\u2192persona shift  7\u2192hard fallback")
@@ -669,34 +787,46 @@ def chat_with_feeling(persona_name="mentor"):
         while True:
             user_input = input("You: ")
             cmd = user_input.strip().lower()
-
             if cmd in ["exit", "quit"]:
                 print("\U0001f44b Ending session.")
                 break
-
             if cmd == "99":
                 print("\U0001f4de Connecting to your empathetic AI assistant...")
                 data = load_dataset()
                 active_persona = build_persona(data, persona_name, DYNAMIC_WEIGHTS)
                 print(f"   Persona adapted ({avg_conf_str(RECENT_SCORES)}).")
                 continue
-
             if cmd == "stats":
                 dataset_stats()
                 continue
-
             if cmd == "validate":
                 validate_dataset()
                 continue
-
             if cmd == "gold":
                 export_gold_dataset()
                 continue
-
             if cmd == "conflicts":
                 show_conflicts()
                 continue
-
+            if cmd.startswith("resolve ") and len(cmd.split()) >= 2:
+                parts = user_input.split(maxsplit=2)
+                try:
+                    idx = int(parts[1])
+                    correction = parts[2] if len(parts) > 2 else ""
+                    if correction:
+                        resolve_conflict(idx, correction)
+                    else:
+                        resolve_conflict(idx, "")
+                except (ValueError, IndexError):
+                    print("   Usage: resolve <index> <correction>")
+                continue
+            if cmd.startswith("resolve-skip") and len(cmd.split()) >= 2:
+                try:
+                    idx = int(cmd.split()[1])
+                    skip_conflict(idx)
+                except (ValueError, IndexError):
+                    print("   Usage: resolve-skip <index>")
+                continue
             if cmd.startswith("correct") and LAST_REPLY is not None:
                 corrected = user_input[len("correct"):].strip()
                 if corrected:
@@ -706,12 +836,11 @@ def chat_with_feeling(persona_name="mentor"):
                     print("   Variations generated.")
                     LAST_REPLY = corrected
                 continue
-
             prompt = apply_template(user_input, DYNAMIC_WEIGHTS)
             if DYNAMIC_WEIGHTS and "+" in persona_name:
                 active_persona = build_persona(data, persona_name, DYNAMIC_WEIGHTS)
                 print(f"   \U0001f504 Weights: {DYNAMIC_WEIGHTS}")
-
+                log_weights(DYNAMIC_WEIGHTS)
             try:
                 response = ollama.chat(
                     model=MODEL_VERSION,
@@ -725,18 +854,14 @@ def chat_with_feeling(persona_name="mentor"):
                 RECENT_SCORES.append(score)
                 if len(RECENT_SCORES) > 20:
                     RECENT_SCORES.pop(0)
-
                 if score < 50:
                     CONSECUTIVE_LOW += 1
                 else:
                     CONSECUTIVE_LOW = 0
-
                 print(f"Ollama: {reply}  [confidence: {score}/100]")
-
                 LAST_PROMPT = prompt
                 LAST_REPLY = reply
                 LAST_SCORE = score
-
                 if score < 50:
                     append_to_weak(prompt, reply, score)
                     tier_reply = handle_escalation_tier(CONSECUTIVE_LOW, user_input, prompt)
@@ -760,10 +885,8 @@ def chat_with_feeling(persona_name="mentor"):
                     if score > 90:
                         print("   \u2705 Auto-approved (score > 90).")
                     append_to_dataset(prompt, reply)
-
             except Exception:
                 print("\u26a0\ufe0f", FALLBACK)
-
     except KeyboardInterrupt:
         print("\n\U0001f44b Session interrupted. Goodbye!")
 
@@ -805,7 +928,6 @@ if __name__ == "__main__":
             rest.append(arg)
             i += 1
     sys.argv = [sys.argv[0]] + rest
-
     if "--stats" in sys.argv:
         dataset_stats()
     elif "--validate" in sys.argv:

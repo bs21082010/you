@@ -78,11 +78,7 @@ def score_reply(reply):
     return max(score, 0)
 
 
-def dataset_stats(path=DATASET_PATH):
-    data = load_dataset(path)
-    if not data:
-        print("📭 Dataset is empty.")
-        return
+def topic_balance(data):
     prompts = [d["prompt"] for d in data]
     topics = Counter()
     for p in prompts:
@@ -92,6 +88,23 @@ def dataset_stats(path=DATASET_PATH):
                 break
         else:
             topics["general"] += 1
+    if not topics:
+        return topics
+    total = sum(topics.values())
+    ideal = total / len(topics)
+    print("   ⚖️  Balance:")
+    for topic, count in topics.most_common():
+        sign = "+" if count >= ideal else "−"
+        print(f"      {topic}: {count} ({sign}{abs(count - ideal):.0f} vs ideal)")
+    return topics
+
+
+def dataset_stats(path=DATASET_PATH):
+    data = load_dataset(path)
+    if not data:
+        print("📭 Dataset is empty.")
+        return
+    topics = topic_balance(data)
     print(f"📊 Dataset: {len(data)} entries | Model: {MODEL_VERSION}")
     for topic, count in topics.most_common():
         print(f"   {topic}: {count}")
@@ -118,6 +131,36 @@ def validate_dataset(path=DATASET_PATH):
         print("✅ All entries valid.")
     else:
         print(f"⚠️  {issues} issue(s) found. Consider reviewing.")
+
+
+def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="empathetic-mentor"):
+    data = load_dataset(path)
+    if len(data) < 5:
+        print("⚠️  Need at least 5 dataset entries to train.")
+        return
+    print(f"🧠 Training '{new_model}' from {base_model} using {len(data)} examples...")
+    few_shot = ""
+    for i, entry in enumerate(data[:20]):
+        few_shot += f"User: {entry['prompt']}\nAssistant: {entry['completion']}\n\n"
+    modelfile = f"""FROM {base_model}
+SYSTEM \"\"\"{PERSONA.strip()}\"\"\"
+TEMPLATE \"\"\"System: {PERSONA.strip()}
+
+{few_shot}
+User: {{.Prompt}}
+Assistant: \"\"\"
+"""
+    modelfile_path = "Modelfile.tmp"
+    with open(modelfile_path, "w", encoding="utf-8") as f:
+        f.write(modelfile)
+    try:
+        ollama.create(model=new_model, modelfile=modelfile_path)
+        print(f"✅ Model '{new_model}' created. Run it with: ollama run {new_model}")
+    except Exception as e:
+        print(f"⚠️ Training failed: {e}")
+    finally:
+        if os.path.exists(modelfile_path):
+            os.remove(modelfile_path)
 
 
 def apply_template(user_input):
@@ -181,7 +224,12 @@ def chat_with_feeling():
                 LAST_REPLY = reply
                 LAST_SCORE = score
 
-                if score < SCORE_THRESHOLD:
+                if score < 50:
+                    append_to_weak(prompt, reply, score)
+                    print(f"⚠️  Score {score}/100 — auto-rejected. Using fallback.")
+                    print("Ollama:", FALLBACK)
+                    append_to_dataset(prompt, FALLBACK)
+                elif score < SCORE_THRESHOLD:
                     append_to_weak(prompt, reply, score)
                     print(f"⚠️  Reply scored {score}/100 — below threshold.")
                     fix = input("   Correct it? (leave blank to skip, or type correction): ").strip()
@@ -191,6 +239,8 @@ def chat_with_feeling():
                         generate_variations(prompt, fix)
                         print("   Variations generated.")
                 else:
+                    if score > 90:
+                        print("   ✅ Auto-approved (score > 90).")
                     append_to_dataset(prompt, reply)
 
             except Exception:
@@ -205,5 +255,7 @@ if __name__ == "__main__":
         dataset_stats()
     elif "--validate" in sys.argv:
         validate_dataset()
+    elif "--train" in sys.argv:
+        train_from_dataset()
     else:
         chat_with_feeling()

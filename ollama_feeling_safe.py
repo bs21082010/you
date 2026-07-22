@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import shutil
+import subprocess
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -11,23 +12,42 @@ from collections import Counter
 MODEL_VERSION = "llama3.2"
 DATASET_PATH = "curated_dataset.jsonl"
 WEAK_REPLIES_PATH = "weak_replies.jsonl"
+GOLD_DIR = "gold"
 SNAPSHOT_DIR = "snapshots"
+SYNC_DIR = None
 SCORE_THRESHOLD = 70
 LAST_REPLY = None
 LAST_PROMPT = None
 LAST_SCORE = None
 
-EXTERNAL_SEARCH_URL = "https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
-EXTERNAL_ENABLED = False  # set True and configure SEARCH_URL for live lookups
+EXTERNAL_ENABLED = False
+EXTERNAL_SOURCES = {
+    "duckduckgo": "https://api.duckduckgo.com/?q={query}&format=json&no_html=1",
+    "wikipedia": "https://en.wikipedia.org/api/rest_v1/page/summary/{query}",
+}
 
-PERSONA_BASE = f"""
-You are a warm, empathetic mentor.
+PERSONAS = {
+    "mentor": f"""You are a warm, empathetic mentor.
 Always respond with encouragement, positivity, and emotional awareness.
 Use supportive language, motivational tone, and show understanding.
 Never give harmful or misleading advice.
-If you are uncertain about something, say: "I don't have that information right now, but I can help you explore it."
-You are running on {MODEL_VERSION}.
-"""
+If uncertain, say you don't know but offer to help explore it.
+You are running on {MODEL_VERSION}.""",
+
+    "coach": f"""You are a direct, results-oriented coach.
+Always respond with clarity, actionable steps, and accountability.
+Push the user toward growth with firm but supportive language.
+Never give harmful or misleading advice.
+If uncertain, say you don't know but offer to help explore it.
+You are running on {MODEL_VERSION}.""",
+
+    "teacher": f"""You are a patient, knowledgeable teacher.
+Always respond with structured explanations, examples, and clarity.
+Break complex topics into digestible steps.
+Never give harmful or misleading advice.
+If uncertain, say you don't know but offer to help explore it.
+You are running on {MODEL_VERSION}.""",
+}
 
 FALLBACK = "I don't have that information right now, but I can help you explore it."
 
@@ -103,8 +123,8 @@ def topic_distribution(data):
     return topics
 
 
-def build_persona(data=None):
-    persona = PERSONA_BASE
+def build_persona(data=None, persona_name="mentor"):
+    persona = PERSONAS.get(persona_name, PERSONAS["mentor"])
     if data and len(data) >= 3:
         topics = topic_distribution(data)
         total = sum(topics.values()) or 1
@@ -167,16 +187,106 @@ def validate_dataset(path=DATASET_PATH):
         print(f"⚠️  {issues} issue(s) found. Consider reviewing.")
 
 
-def export_snapshot(path=DATASET_PATH):
+def export_snapshot(path=DATASET_PATH, label=""):
     if not os.path.exists(path):
         print("⚠️  No dataset to snapshot.")
         return
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    snapshot_path = os.path.join(SNAPSHOT_DIR, f"curated_{timestamp}.jsonl")
+    suffix = f"_{label}" if label else ""
+    snapshot_path = os.path.join(SNAPSHOT_DIR, f"curated_{timestamp}{suffix}.jsonl")
     shutil.copy2(path, snapshot_path)
     print(f"📸 Snapshot saved: {snapshot_path}")
     return snapshot_path
+
+
+def export_gold_dataset(path=DATASET_PATH, min_score=90):
+    data = load_dataset(path)
+    if not data:
+        print("📭 No entries to export.")
+        return
+    os.makedirs(GOLD_DIR, exist_ok=True)
+    gold_path = os.path.join(GOLD_DIR, "gold_dataset.jsonl")
+    count = 0
+    with open(gold_path, "w", encoding="utf-8") as out:
+        for entry in data:
+            s = score_completion(entry["completion"])
+            if s >= min_score:
+                out.write(json.dumps({"prompt": entry["prompt"], "completion": entry["completion"], "_score": s}) + "\n")
+                count += 1
+    print(f"🥇 Gold dataset exported: {gold_path} ({count} entries, score >= {min_score})")
+    return gold_path
+
+
+def sync_dataset(target_dir=None):
+    dest = target_dir or SYNC_DIR
+    if not dest:
+        print("⚠️  No sync target directory set. Configure SYNC_DIR or pass --sync-dir.")
+        return
+    os.makedirs(dest, exist_ok=True)
+    files_to_sync = []
+    if os.path.exists(DATASET_PATH):
+        files_to_sync.append(DATASET_PATH)
+    if os.path.exists(WEAK_REPLIES_PATH):
+        files_to_sync.append(WEAK_REPLIES_PATH)
+    snapshot = export_snapshot()
+    if snapshot:
+        files_to_sync.append(snapshot)
+    gold = export_gold_dataset()
+    if gold:
+        files_to_sync.append(gold)
+    for f in files_to_sync:
+        shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
+        print(f"   Synced: {os.path.basename(f)}")
+    print(f"📤 Sync complete → {dest}")
+
+
+def fetch_source(source_name, query):
+    url_template = EXTERNAL_SOURCES.get(source_name)
+    if not url_template:
+        return None
+    try:
+        encoded = urllib.parse.quote(query)
+        if source_name == "wikipedia":
+            clean = query.strip().replace(" ", "_")
+            url = url_template.format(query=clean)
+        else:
+            url = url_template.format(query=encoded)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            if source_name == "duckduckgo":
+                abstract = data.get("AbstractText", "")
+                if abstract:
+                    return ("DuckDuckGo", abstract)
+                results = data.get("RelatedTopics", [])
+                if results:
+                    text = results[0].get("Text", "")
+                    if text:
+                        return ("DuckDuckGo", text)
+            elif source_name == "wikipedia":
+                extract = data.get("extract", "")
+                if extract:
+                    return ("Wikipedia", extract[:500])
+    except Exception:
+        pass
+    return None
+
+
+def layered_lookup(query):
+    results = []
+    for source in EXTERNAL_SOURCES:
+        result = fetch_source(source, query)
+        if result:
+            results.append(result)
+    return results
+
+
+def apply_template(user_input):
+    for key, template in PROMPT_TEMPLATES.items():
+        if user_input.lower().startswith(key):
+            return template.format(query=user_input[len(key):].strip())
+    return user_input
 
 
 def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="empathetic-mentor", min_score=80):
@@ -226,44 +336,17 @@ Assistant: \"\"\"
             os.remove(modelfile_path)
 
 
-def external_lookup(query):
-    if not EXTERNAL_ENABLED:
-        return None
-    try:
-        url = EXTERNAL_SEARCH_URL.format(query=urllib.parse.quote(query))
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            abstract = data.get("AbstractText", "")
-            if abstract:
-                return abstract
-            results = data.get("RelatedTopics", [])
-            if results:
-                return results[0].get("Text", None)
-    except Exception:
-        pass
-    return None
-
-
-def apply_template(user_input):
-    for key, template in PROMPT_TEMPLATES.items():
-        if user_input.lower().startswith(key):
-            return template.format(query=user_input[len(key):].strip())
-    return user_input
-
-
-def chat_with_feeling():
+def chat_with_feeling(persona_name="mentor"):
     global LAST_REPLY, LAST_PROMPT, LAST_SCORE
 
     data = load_dataset()
-    persona = build_persona(data)
-    active_persona = persona
+    active_persona = build_persona(data, persona_name)
 
-    print("💡 Emotional Ollama Chat Started")
+    print(f"💡 Emotional Ollama Chat Started  [persona: {persona_name}]")
     print(f"   Model: {MODEL_VERSION}  |  Dataset: {DATASET_PATH}")
-    print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate")
+    print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold")
     if EXTERNAL_ENABLED:
-        print("   🌐 External knowledge fallback is ON")
+        print(f"   🌐 External knowledge: {', '.join(EXTERNAL_SOURCES)}")
     try:
         while True:
             user_input = input("You: ")
@@ -276,8 +359,8 @@ def chat_with_feeling():
             if cmd == "99":
                 print("📞 Connecting to your empathetic AI assistant...")
                 data = load_dataset()
-                active_persona = build_persona(data)
-                print("   Persona adapted to current dataset distribution.")
+                active_persona = build_persona(data, persona_name)
+                print(f"   Persona '{persona_name}' adapted to current dataset distribution.")
                 continue
 
             if cmd == "stats":
@@ -286,6 +369,10 @@ def chat_with_feeling():
 
             if cmd == "validate":
                 validate_dataset()
+                continue
+
+            if cmd == "gold":
+                export_gold_dataset()
                 continue
 
             if cmd.startswith("correct") and LAST_REPLY is not None:
@@ -317,10 +404,11 @@ def chat_with_feeling():
 
                 if score < 50:
                     append_to_weak(prompt, reply, score)
-                    external = external_lookup(user_input)
-                    if external:
-                        fallback_reply = f"I checked an external source: {external}"
-                        print(f"   🌐 External result: {fallback_reply}")
+                    external_results = layered_lookup(user_input) if EXTERNAL_ENABLED else []
+                    if external_results:
+                        parts = [f"[{source}] {text}" for source, text in external_results]
+                        fallback_reply = f"I checked multiple sources:\n" + "\n".join(parts)
+                        print(f"   🌐 Layered results:\n" + "\n".join(parts))
                         append_to_dataset(prompt, fallback_reply)
                     else:
                         print(f"⚠️  Score {score}/100 — auto-rejected. Using fallback.")
@@ -348,11 +436,35 @@ def chat_with_feeling():
 
 
 if __name__ == "__main__":
+    persona_name = "mentor"
+    sync_target = None
+    rest = []
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "--persona" and i + 1 < len(sys.argv):
+            persona_name = sys.argv[i + 1]
+            i += 2
+        elif arg == "--sync" and i + 1 < len(sys.argv):
+            sync_target = sys.argv[i + 1]
+            i += 2
+        elif arg == "--sync-dir" and i + 1 < len(sys.argv):
+            sync_target = sys.argv[i + 1]
+            i += 2
+        else:
+            rest.append(arg)
+            i += 1
+    sys.argv = [sys.argv[0]] + rest
+
     if "--stats" in sys.argv:
         dataset_stats()
     elif "--validate" in sys.argv:
         validate_dataset()
+    elif "--gold" in sys.argv:
+        export_gold_dataset()
     elif "--train" in sys.argv:
         train_from_dataset()
+    elif "--sync" in sys.argv or sync_target:
+        sync_dataset(sync_target)
     else:
-        chat_with_feeling()
+        chat_with_feeling(persona_name=persona_name)

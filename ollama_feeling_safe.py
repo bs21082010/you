@@ -6,21 +6,25 @@ import shutil
 import hashlib
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import Counter
 
 MODEL_VERSION = "llama3.2"
 DATASET_PATH = "curated_dataset.jsonl"
 WEAK_REPLIES_PATH = "weak_replies.jsonl"
 CACHE_PATH = "knowledge_cache.jsonl"
+CONFLICT_PATH = "conflict_queue.jsonl"
 GOLD_DIR = "gold"
 SNAPSHOT_DIR = "snapshots"
 SYNC_DIR = None
 SCORE_THRESHOLD = 70
+CACHE_MAX_DAYS = 7
+LOW_CONF_ESCALATION_COUNT = 3
 LAST_REPLY = None
 LAST_PROMPT = None
 LAST_SCORE = None
 RECENT_SCORES = []
+CONSECUTIVE_LOW = 0
 
 EXTERNAL_ENABLED = False
 EXTERNAL_SOURCES = {
@@ -29,26 +33,23 @@ EXTERNAL_SOURCES = {
 }
 
 PERSONAS = {
-    "mentor": f"""You are a warm, empathetic mentor.
+    "mentor": """You are a warm, empathetic mentor.
 Always respond with encouragement, positivity, and emotional awareness.
 Use supportive language, motivational tone, and show understanding.
 Never give harmful or misleading advice.
-If uncertain, say you don't know but offer to help explore it.
-You are running on {MODEL_VERSION}.""",
+If uncertain, say you don't know but offer to help explore it.""",
 
-    "coach": f"""You are a direct, results-oriented coach.
+    "coach": """You are a direct, results-oriented coach.
 Always respond with clarity, actionable steps, and accountability.
 Push the user toward growth with firm but supportive language.
 Never give harmful or misleading advice.
-If uncertain, say you don't know but offer to help explore it.
-You are running on {MODEL_VERSION}.""",
+If uncertain, say you don't know but offer to help explore it.""",
 
-    "teacher": f"""You are a patient, knowledgeable teacher.
+    "teacher": """You are a patient, knowledgeable teacher.
 Always respond with structured explanations, examples, and clarity.
 Break complex topics into digestible steps.
 Never give harmful or misleading advice.
-If uncertain, say you don't know but offer to help explore it.
-You are running on {MODEL_VERSION}.""",
+If uncertain, say you don't know but offer to help explore it.""",
 }
 
 FALLBACK = "I don't have that information right now, but I can help you explore it."
@@ -77,6 +78,20 @@ def append_to_weak(prompt, completion, score, path=WEAK_REPLIES_PATH):
         f.write(json.dumps({"prompt": prompt, "completion": completion, "score": score}) + "\n")
 
 
+def append_conflict(prompt, completion_a, score_a, completion_b, score_b):
+    entry = {
+        "prompt": prompt,
+        "completions": [
+            {"completion": completion_a, "score": score_a},
+            {"completion": completion_b, "score": score_b},
+        ],
+        "flagged_at": datetime.now().isoformat(),
+    }
+    with open(CONFLICT_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+    print("   \u2697\ufe0f Conflict flagged — both completions saved to conflict_queue.jsonl")
+
+
 def query_hash(query):
     return hashlib.sha256(query.strip().lower().encode()).hexdigest()[:16]
 
@@ -85,19 +100,39 @@ def cache_lookup(query):
     if not os.path.exists(CACHE_PATH):
         return None
     qh = query_hash(query)
+    now = datetime.now()
+    fresh = []
+    stale_entries = []
     with open(CACHE_PATH, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             entry = json.loads(line)
-            if entry.get("query_hash") == qh:
-                return entry["results"]
+            cached_at = entry.get("cached_at", "")
+            try:
+                age = now - datetime.fromisoformat(cached_at)
+                if age > timedelta(days=CACHE_MAX_DAYS):
+                    stale_entries.append(entry)
+                    continue
+            except Exception:
+                pass
+            fresh.append(entry)
+    if stale_entries:
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            for entry in fresh:
+                f.write(json.dumps(entry) + "\n")
+    for entry in fresh:
+        if entry.get("query_hash") == qh:
+            return entry["results"]
     return None
 
 
 def cache_store(query, results):
-    entry = {"query_hash": query_hash(query), "query": query, "results": results, "cached_at": datetime.now().isoformat()}
+    entry = {
+        "query_hash": query_hash(query), "query": query,
+        "results": results, "cached_at": datetime.now().isoformat(),
+    }
     with open(CACHE_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -150,23 +185,48 @@ def topic_distribution(data):
     return topics
 
 
-def chain_personas(names):
-    parts = names.split("+")
-    merged = []
-    for name in parts:
-        p = PERSONAS.get(name.strip())
-        if p:
-            merged.append(p.strip())
-    if not merged:
-        return PERSONAS["mentor"]
-    combined = "\n\n".join(merged)
+def orchestrate_persona(spec):
+    parts = spec.split("+")
+    segments = []
+    for part in parts:
+        part = part.strip()
+        if ":" in part:
+            name, weight_str = part.rsplit(":", 1)
+            try:
+                weight = int(weight_str)
+            except ValueError:
+                weight = 50
+        else:
+            name = part
+            weight = 50
+        base = PERSONAS.get(name.strip())
+        if base:
+            segments.append((base.strip(), weight))
+    if not segments:
+        return PERSONAS["mentor"] + f"\n\nYou are running on {MODEL_VERSION}."
+
+    total_weight = sum(w for _, w in segments)
+    if total_weight == 0:
+        total_weight = 1
+
+    blended_parts = []
+    for text, weight in segments:
+        pct = weight / total_weight
+        emphasis = "strongly" if pct > 0.5 else "moderately" if pct > 0.2 else "slightly"
+        blended_parts.append(f"[{emphasis} weighted at {weight}%]\n{text}")
+    combined = "\n\n".join(blended_parts)
     combined += f"\n\nYou are running on {MODEL_VERSION}."
     return combined
 
 
 def build_persona(data=None, persona_name="mentor"):
-    if "+" in persona_name:
-        persona = chain_personas(persona_name)
+    if "+" in persona_name and ":" in persona_name:
+        persona = orchestrate_persona(persona_name)
+    elif "+" in persona_name:
+        persona = "\n\n".join(PERSONAS.get(p.strip(), "").strip() for p in persona_name.split("+") if p.strip() in PERSONAS)
+        if not persona:
+            persona = PERSONAS["mentor"]
+        persona += f"\n\nYou are running on {MODEL_VERSION}."
     else:
         persona = PERSONAS.get(persona_name, PERSONAS["mentor"])
 
@@ -181,14 +241,11 @@ def build_persona(data=None, persona_name="mentor"):
     if data and len(data) >= 3:
         topics = topic_distribution(data)
         total = sum(topics.values()) or 1
-        motivated_share = topics.get("motivate", 0) / total
-        advise_share = topics.get("advise", 0) / total
-        explain_share = topics.get("explain", 0) / total
-        if motivated_share < 0.2:
+        if topics.get("motivate", 0) / total < 0.2:
             persona += "\nEmphasize motivation and encouragement in your responses."
-        if advise_share < 0.2:
+        if topics.get("advise", 0) / total < 0.2:
             persona += "\nActively offer actionable advice and guidance."
-        if explain_share > 0.5:
+        if topics.get("explain", 0) / total > 0.5:
             persona += "\nPrioritize clarity and simplicity in explanations."
     return persona
 
@@ -218,6 +275,7 @@ def dataset_stats(path=DATASET_PATH):
     avg_conf = (sum(RECENT_SCORES) / len(RECENT_SCORES)) if RECENT_SCORES else None
     if avg_conf is not None:
         print(f"   Recent avg confidence: {avg_conf:.0f}/100")
+        print(f"   Consecutive low: {CONSECUTIVE_LOW}/{LOW_CONF_ESCALATION_COUNT}")
 
 
 def validate_dataset(path=DATASET_PATH):
@@ -285,6 +343,8 @@ def sync_dataset(target_dir=None):
         files_to_sync.append(DATASET_PATH)
     if os.path.exists(WEAK_REPLIES_PATH):
         files_to_sync.append(WEAK_REPLIES_PATH)
+    if os.path.exists(CONFLICT_PATH):
+        files_to_sync.append(CONFLICT_PATH)
     snapshot = export_snapshot()
     if snapshot:
         files_to_sync.append(snapshot)
@@ -313,6 +373,8 @@ def federated_sync(remote_dir):
             current_score = score_completion(entry.get("completion", ""))
             if current_score > existing_score:
                 seen[key] = entry
+            elif current_score == existing_score:
+                append_conflict(key, existing["completion"], existing_score, entry["completion"], current_score)
         else:
             seen[key] = entry
     merged = list(seen.values())
@@ -424,7 +486,7 @@ Assistant: \"\"\"
 
 
 def chat_with_feeling(persona_name="mentor"):
-    global LAST_REPLY, LAST_PROMPT, LAST_SCORE, RECENT_SCORES
+    global LAST_REPLY, LAST_PROMPT, LAST_SCORE, RECENT_SCORES, CONSECUTIVE_LOW
 
     data = load_dataset()
     active_persona = build_persona(data, persona_name)
@@ -434,6 +496,7 @@ def chat_with_feeling(persona_name="mentor"):
     print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold")
     if EXTERNAL_ENABLED:
         print(f"   \U0001f310 External knowledge: {', '.join(EXTERNAL_SOURCES)}")
+        print(f"   Cache TTL: {CACHE_MAX_DAYS}d  |  Escalation after {LOW_CONF_ESCALATION_COUNT} consecutive low")
     try:
         while True:
             user_input = input("You: ")
@@ -447,7 +510,7 @@ def chat_with_feeling(persona_name="mentor"):
                 print("\U0001f4de Connecting to your empathetic AI assistant...")
                 data = load_dataset()
                 active_persona = build_persona(data, persona_name)
-                print(f"   Persona '{persona_name}' adapted to dataset and recent confidence ({avg_conf_str(RECENT_SCORES)}).")
+                print(f"   Persona adapted ({avg_conf_str(RECENT_SCORES)}).")
                 continue
 
             if cmd == "stats":
@@ -486,15 +549,25 @@ def chat_with_feeling(persona_name="mentor"):
                 RECENT_SCORES.append(score)
                 if len(RECENT_SCORES) > 20:
                     RECENT_SCORES.pop(0)
+
+                if score < 50:
+                    CONSECUTIVE_LOW += 1
+                else:
+                    CONSECUTIVE_LOW = 0
+
                 print(f"Ollama: {reply}  [confidence: {score}/100]")
 
                 LAST_PROMPT = prompt
                 LAST_REPLY = reply
                 LAST_SCORE = score
 
+                escalated = EXTERNAL_ENABLED and CONSECUTIVE_LOW >= LOW_CONF_ESCALATION_COUNT
+
                 if score < 50:
                     append_to_weak(prompt, reply, score)
                     external_results = layered_lookup(user_input) if EXTERNAL_ENABLED else []
+                    if escalated:
+                        print(f"   \U0001f6c8 Escalating — {CONSECUTIVE_LOW} consecutive low-confidence replies.")
                     if external_results:
                         parts = [f"[{source}] {text}" for source, text in external_results]
                         fallback_reply = f"I checked multiple sources:\n" + "\n".join(parts)
@@ -517,6 +590,10 @@ def chat_with_feeling(persona_name="mentor"):
                     if score > 90:
                         print("   \u2705 Auto-approved (score > 90).")
                     append_to_dataset(prompt, reply)
+
+                if escalated:
+                    print(f"   \U0001f6c8 Low-confidence streak reset.")
+                    CONSECUTIVE_LOW = 0
 
             except Exception:
                 print("\u26a0\ufe0f", FALLBACK)

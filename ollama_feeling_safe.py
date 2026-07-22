@@ -6,6 +6,7 @@ import shutil
 import hashlib
 import urllib.request
 import urllib.parse
+import re
 from datetime import datetime, timedelta
 from collections import Counter
 
@@ -18,19 +19,21 @@ GOLD_DIR = "gold"
 SNAPSHOT_DIR = "snapshots"
 SYNC_DIR = None
 SCORE_THRESHOLD = 70
-CACHE_MAX_DAYS = 7
-LOW_CONF_ESCALATION_COUNT = 3
+SCORE_TIERS = {3: "external", 5: "persona_shift", 7: "hard_fallback"}
 LAST_REPLY = None
 LAST_PROMPT = None
 LAST_SCORE = None
 RECENT_SCORES = []
 CONSECUTIVE_LOW = 0
+DYNAMIC_WEIGHTS = {}
+PERSONA_SPEC = "mentor"
 
 EXTERNAL_ENABLED = False
 EXTERNAL_SOURCES = {
     "duckduckgo": "https://api.duckduckgo.com/?q={query}&format=json&no_html=1",
     "wikipedia": "https://en.wikipedia.org/api/rest_v1/page/summary/{query}",
 }
+FRESHNESS_DAYS = {"duckduckgo": 3, "wikipedia": 14}
 
 PERSONAS = {
     "mentor": """You are a warm, empathetic mentor.
@@ -89,7 +92,7 @@ def append_conflict(prompt, completion_a, score_a, completion_b, score_b):
     }
     with open(CONFLICT_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
-    print("   \u2697\ufe0f Conflict flagged — both completions saved to conflict_queue.jsonl")
+    print("   \u2697\ufe0f Conflict flagged \u2014 both completions saved to conflict_queue.jsonl")
 
 
 def query_hash(query):
@@ -102,23 +105,25 @@ def cache_lookup(query):
     qh = query_hash(query)
     now = datetime.now()
     fresh = []
-    stale_entries = []
+    stale = []
     with open(CACHE_PATH, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             entry = json.loads(line)
+            source = entry.get("source", "duckduckgo")
+            max_age = FRESHNESS_DAYS.get(source, 7)
             cached_at = entry.get("cached_at", "")
             try:
                 age = now - datetime.fromisoformat(cached_at)
-                if age > timedelta(days=CACHE_MAX_DAYS):
-                    stale_entries.append(entry)
+                if age > timedelta(days=max_age):
+                    stale.append(entry)
                     continue
             except Exception:
                 pass
             fresh.append(entry)
-    if stale_entries:
+    if stale:
         with open(CACHE_PATH, "w", encoding="utf-8") as f:
             for entry in fresh:
                 f.write(json.dumps(entry) + "\n")
@@ -129,12 +134,14 @@ def cache_lookup(query):
 
 
 def cache_store(query, results):
-    entry = {
-        "query_hash": query_hash(query), "query": query,
-        "results": results, "cached_at": datetime.now().isoformat(),
-    }
-    with open(CACHE_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    for source, _ in results:
+        entry = {
+            "query_hash": query_hash(query), "query": query,
+            "source": source, "results": results,
+            "cached_at": datetime.now().isoformat(),
+        }
+        with open(CACHE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
 
 
 def generate_variations(prompt, corrected):
@@ -185,7 +192,18 @@ def topic_distribution(data):
     return topics
 
 
-def orchestrate_persona(spec):
+def detect_intent(user_input):
+    lower = user_input.lower()
+    if any(w in lower for w in ["motivate", "inspire", "encourage", "push", "hype"]):
+        return "motivate"
+    if any(w in lower for w in ["explain", "what is", "how does", "define", "tell me about"]):
+        return "explain"
+    if any(w in lower for w in ["advise", "should i", "what should", "recommend", "suggest"]):
+        return "advise"
+    return None
+
+
+def orchestrate_persona(spec, dynamic_overrides=None):
     parts = spec.split("+")
     segments = []
     for part in parts:
@@ -200,15 +218,15 @@ def orchestrate_persona(spec):
             name = part
             weight = 50
         base = PERSONAS.get(name.strip())
+        if dynamic_overrides and name.strip() in dynamic_overrides:
+            weight = dynamic_overrides[name.strip()]
         if base:
             segments.append((base.strip(), weight))
     if not segments:
         return PERSONAS["mentor"] + f"\n\nYou are running on {MODEL_VERSION}."
-
     total_weight = sum(w for _, w in segments)
     if total_weight == 0:
         total_weight = 1
-
     blended_parts = []
     for text, weight in segments:
         pct = weight / total_weight
@@ -219,14 +237,9 @@ def orchestrate_persona(spec):
     return combined
 
 
-def build_persona(data=None, persona_name="mentor"):
-    if "+" in persona_name and ":" in persona_name:
-        persona = orchestrate_persona(persona_name)
-    elif "+" in persona_name:
-        persona = "\n\n".join(PERSONAS.get(p.strip(), "").strip() for p in persona_name.split("+") if p.strip() in PERSONAS)
-        if not persona:
-            persona = PERSONAS["mentor"]
-        persona += f"\n\nYou are running on {MODEL_VERSION}."
+def build_persona(data=None, persona_name="mentor", dynamic_overrides=None):
+    if "+" in persona_name:
+        persona = orchestrate_persona(persona_name, dynamic_overrides)
     else:
         persona = PERSONAS.get(persona_name, PERSONAS["mentor"])
 
@@ -275,7 +288,7 @@ def dataset_stats(path=DATASET_PATH):
     avg_conf = (sum(RECENT_SCORES) / len(RECENT_SCORES)) if RECENT_SCORES else None
     if avg_conf is not None:
         print(f"   Recent avg confidence: {avg_conf:.0f}/100")
-        print(f"   Consecutive low: {CONSECUTIVE_LOW}/{LOW_CONF_ESCALATION_COUNT}")
+        print(f"   Consecutive low: {CONSECUTIVE_LOW}")
 
 
 def validate_dataset(path=DATASET_PATH):
@@ -357,7 +370,7 @@ def sync_dataset(target_dir=None):
     print(f"\U0001f4e4 Sync complete \u2192 {dest}")
 
 
-def federated_sync(remote_dir):
+def federated_sync(remote_dir, merge_policy="highest"):
     if not os.path.isdir(remote_dir):
         print(f"\u26a0\ufe0f  Remote dir not found: {remote_dir}")
         return
@@ -365,23 +378,37 @@ def federated_sync(remote_dir):
     remote_path = os.path.join(remote_dir, DATASET_PATH)
     remote_data = load_dataset(remote_path) if os.path.exists(remote_path) else []
     seen = {}
+    conflicts = []
     for entry in local_data + remote_data:
         key = entry.get("prompt", "")
         existing = seen.get(key)
         if existing:
             existing_score = score_completion(existing.get("completion", ""))
             current_score = score_completion(entry.get("completion", ""))
-            if current_score > existing_score:
-                seen[key] = entry
-            elif current_score == existing_score:
-                append_conflict(key, existing["completion"], existing_score, entry["completion"], current_score)
+            if merge_policy == "keep-both":
+                conflicts.append((key, existing["completion"], existing_score, entry["completion"], current_score))
+                continue
+            elif merge_policy == "manual":
+                conflicts.append((key, existing["completion"], existing_score, entry["completion"], current_score))
+                continue
+            else:
+                if current_score > existing_score:
+                    seen[key] = entry
+                elif current_score == existing_score:
+                    conflicts.append((key, existing["completion"], existing_score, entry["completion"], current_score))
         else:
             seen[key] = entry
+    for key, ca, sa, cb, sb in conflicts:
+        if merge_policy == "keep-both":
+            seen[key + "_v1"] = {"prompt": key + " [v1]", "completion": ca}
+            seen[key + "_v2"] = {"prompt": key + " [v2]", "completion": cb}
+        elif merge_policy == "manual":
+            append_conflict(key, ca, sa, cb, sb)
     merged = list(seen.values())
     with open(DATASET_PATH, "w", encoding="utf-8") as f:
         for entry in merged:
             f.write(json.dumps({"prompt": entry["prompt"], "completion": entry["completion"]}) + "\n")
-    print(f"\U0001f91d Federated merge complete: {len(merged)} entries ({len(local_data)} local + {len(remote_data)} remote)")
+    print(f"\U0001f91d Federated merge [{merge_policy}]: {len(merged)} entries ({len(local_data)} local + {len(remote_data)} remote)")
 
 
 def fetch_source(source_name, query):
@@ -401,16 +428,16 @@ def fetch_source(source_name, query):
             if source_name == "duckduckgo":
                 abstract = data.get("AbstractText", "")
                 if abstract:
-                    return ("DuckDuckGo", abstract)
+                    return (source_name, abstract)
                 results = data.get("RelatedTopics", [])
                 if results:
                     text = results[0].get("Text", "")
                     if text:
-                        return ("DuckDuckGo", text)
+                        return (source_name, text)
             elif source_name == "wikipedia":
                 extract = data.get("extract", "")
                 if extract:
-                    return ("Wikipedia", extract[:500])
+                    return (source_name, extract[:500])
     except Exception:
         pass
     return None
@@ -431,7 +458,18 @@ def layered_lookup(query):
     return results
 
 
-def apply_template(user_input):
+def apply_template(user_input, dynamic_weights=None):
+    intent = detect_intent(user_input) if dynamic_weights is not None else None
+    if intent and dynamic_weights is not None:
+        if intent == "motivate" and "coach" in dynamic_weights:
+            dynamic_weights["coach"] = min(dynamic_weights.get("coach", 50) + 15, 100)
+            dynamic_weights["mentor"] = max(dynamic_weights.get("mentor", 50) - 5, 10)
+            dynamic_weights["teacher"] = max(dynamic_weights.get("teacher", 0) - 5, 0)
+        elif intent == "explain" and "teacher" in dynamic_weights:
+            dynamic_weights["teacher"] = min(dynamic_weights.get("teacher", 50) + 15, 100)
+        elif intent == "advise":
+            dynamic_weights["mentor"] = min(dynamic_weights.get("mentor", 50) + 10, 100)
+            dynamic_weights["coach"] = min(dynamic_weights.get("coach", 50) + 10, 100)
     for key, template in PROMPT_TEMPLATES.items():
         if user_input.lower().startswith(key):
             return template.format(query=user_input[len(key):].strip())
@@ -485,8 +523,37 @@ Assistant: \"\"\"
             os.remove(modelfile_path)
 
 
+def handle_escalation_tier(count, user_input, prompt):
+    if count >= 7:
+        print(f"   \U0001f6d1 Tier 3 ({count} consecutive low) \u2014 hard fallback activated.")
+        return "I want to be honest with you \u2014 I\u2019m not confident I can give you a reliable answer right now. Let\u2019s try a different approach or topic."
+    if count >= 5:
+        print(f"   \U0001f6c8 Tier 2 ({count} consecutive low) \u2014 shifting persona to cautious mode.")
+        return None
+    if count >= 3:
+        print(f"   \U0001f310 Tier 1 ({count} consecutive low) \u2014 querying external sources.")
+        external_results = layered_lookup(user_input) if EXTERNAL_ENABLED else []
+        if external_results:
+            parts = [f"[{source}] {text}" for source, text in external_results]
+            return "I checked multiple sources:\n" + "\n".join(parts)
+        return None
+    return None
+
+
 def chat_with_feeling(persona_name="mentor"):
-    global LAST_REPLY, LAST_PROMPT, LAST_SCORE, RECENT_SCORES, CONSECUTIVE_LOW
+    global LAST_REPLY, LAST_PROMPT, LAST_SCORE, RECENT_SCORES, CONSECUTIVE_LOW, DYNAMIC_WEIGHTS, PERSONA_SPEC
+    PERSONA_SPEC = persona_name
+
+    parts = persona_name.split("+")
+    DYNAMIC_WEIGHTS = {}
+    for part in parts:
+        p = part.strip()
+        if ":" in p:
+            name = p.rsplit(":", 1)[0].strip()
+        else:
+            name = p
+        if name in PERSONAS:
+            DYNAMIC_WEIGHTS[name] = 50
 
     data = load_dataset()
     active_persona = build_persona(data, persona_name)
@@ -496,7 +563,7 @@ def chat_with_feeling(persona_name="mentor"):
     print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold")
     if EXTERNAL_ENABLED:
         print(f"   \U0001f310 External knowledge: {', '.join(EXTERNAL_SOURCES)}")
-        print(f"   Cache TTL: {CACHE_MAX_DAYS}d  |  Escalation after {LOW_CONF_ESCALATION_COUNT} consecutive low")
+        print(f"   Escalation tiers: 3\u2192external  5\u2192persona shift  7\u2192hard fallback")
     try:
         while True:
             user_input = input("You: ")
@@ -509,7 +576,7 @@ def chat_with_feeling(persona_name="mentor"):
             if cmd == "99":
                 print("\U0001f4de Connecting to your empathetic AI assistant...")
                 data = load_dataset()
-                active_persona = build_persona(data, persona_name)
+                active_persona = build_persona(data, persona_name, DYNAMIC_WEIGHTS)
                 print(f"   Persona adapted ({avg_conf_str(RECENT_SCORES)}).")
                 continue
 
@@ -535,7 +602,11 @@ def chat_with_feeling(persona_name="mentor"):
                     LAST_REPLY = corrected
                 continue
 
-            prompt = apply_template(user_input)
+            prompt = apply_template(user_input, DYNAMIC_WEIGHTS)
+            if DYNAMIC_WEIGHTS and "+" in persona_name:
+                active_persona = build_persona(data, persona_name, DYNAMIC_WEIGHTS)
+                print(f"   \U0001f504 Dynamic weights: {DYNAMIC_WEIGHTS}")
+
             try:
                 response = ollama.chat(
                     model=MODEL_VERSION,
@@ -561,25 +632,19 @@ def chat_with_feeling(persona_name="mentor"):
                 LAST_REPLY = reply
                 LAST_SCORE = score
 
-                escalated = EXTERNAL_ENABLED and CONSECUTIVE_LOW >= LOW_CONF_ESCALATION_COUNT
-
                 if score < 50:
                     append_to_weak(prompt, reply, score)
-                    external_results = layered_lookup(user_input) if EXTERNAL_ENABLED else []
-                    if escalated:
-                        print(f"   \U0001f6c8 Escalating — {CONSECUTIVE_LOW} consecutive low-confidence replies.")
-                    if external_results:
-                        parts = [f"[{source}] {text}" for source, text in external_results]
-                        fallback_reply = f"I checked multiple sources:\n" + "\n".join(parts)
-                        print(f"   \U0001f310 Layered results:\n" + "\n".join(parts))
-                        append_to_dataset(prompt, fallback_reply)
+                    tier_reply = handle_escalation_tier(CONSECUTIVE_LOW, user_input, prompt)
+                    if tier_reply:
+                        print(f"   \U0001f310 Escalation result:", tier_reply[:100])
+                        append_to_dataset(prompt, tier_reply)
                     else:
-                        print(f"\u26a0\ufe0f  Score {score}/100 — auto-rejected. Using fallback.")
+                        print(f"\u26a0\ufe0f  Score {score}/100 \u2014 auto-rejected. Using fallback.")
                         print("Ollama:", FALLBACK)
                         append_to_dataset(prompt, FALLBACK)
                 elif score < SCORE_THRESHOLD:
                     append_to_weak(prompt, reply, score)
-                    print(f"\u26a0\ufe0f  Reply scored {score}/100 — below threshold.")
+                    print(f"\u26a0\ufe0f  Reply scored {score}/100 \u2014 below threshold.")
                     fix = input("   Correct it? (leave blank to skip, or type correction): ").strip()
                     if fix:
                         append_to_dataset(prompt, fix)
@@ -590,10 +655,6 @@ def chat_with_feeling(persona_name="mentor"):
                     if score > 90:
                         print("   \u2705 Auto-approved (score > 90).")
                     append_to_dataset(prompt, reply)
-
-                if escalated:
-                    print(f"   \U0001f6c8 Low-confidence streak reset.")
-                    CONSECUTIVE_LOW = 0
 
             except Exception:
                 print("\u26a0\ufe0f", FALLBACK)
@@ -612,6 +673,7 @@ def avg_conf_str(scores):
 if __name__ == "__main__":
     persona_name = "mentor"
     sync_target = None
+    merge_policy = "highest"
     rest = []
     i = 1
     while i < len(sys.argv):
@@ -625,8 +687,11 @@ if __name__ == "__main__":
         elif arg == "--sync-dir" and i + 1 < len(sys.argv):
             sync_target = sys.argv[i + 1]
             i += 2
+        elif arg == "--merge-policy" and i + 1 < len(sys.argv):
+            merge_policy = sys.argv[i + 1]
+            i += 2
         elif arg == "--federated-sync" and i + 1 < len(sys.argv):
-            federated_sync(sys.argv[i + 1])
+            federated_sync(sys.argv[i + 1], merge_policy)
             sys.exit(0)
         else:
             rest.append(arg)

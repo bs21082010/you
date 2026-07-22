@@ -15,11 +15,13 @@ DATASET_PATH = "curated_dataset.jsonl"
 WEAK_REPLIES_PATH = "weak_replies.jsonl"
 CACHE_PATH = "knowledge_cache.jsonl"
 CONFLICT_PATH = "conflict_queue.jsonl"
+ESCALATION_LOG_PATH = "escalation_log.jsonl"
 GOLD_DIR = "gold"
 SNAPSHOT_DIR = "snapshots"
 SYNC_DIR = None
 SCORE_THRESHOLD = 70
-SCORE_TIERS = {3: "external", 5: "persona_shift", 7: "hard_fallback"}
+WEIGHT_BOOST_FACTOR = 12
+WEIGHT_DECAY_PER_TURN = 3
 LAST_REPLY = None
 LAST_PROMPT = None
 LAST_SCORE = None
@@ -33,7 +35,8 @@ EXTERNAL_SOURCES = {
     "duckduckgo": "https://api.duckduckgo.com/?q={query}&format=json&no_html=1",
     "wikipedia": "https://en.wikipedia.org/api/rest_v1/page/summary/{query}",
 }
-FRESHNESS_DAYS = {"duckduckgo": 3, "wikipedia": 14}
+FRESHNESS_DECAY = {"duckduckgo": 7, "wikipedia": 3}
+FRESHNESS_STALE_AT = 30
 
 PERSONAS = {
     "mentor": """You are a warm, empathetic mentor.
@@ -63,6 +66,8 @@ PROMPT_TEMPLATES = {
     "advise": "Offer supportive advice on:\n\n{{query}}",
 }
 
+ESCALATION_EVENTS = []
+
 
 def load_dataset(path=DATASET_PATH):
     if not os.path.exists(path):
@@ -82,28 +87,67 @@ def append_to_weak(prompt, completion, score, path=WEAK_REPLIES_PATH):
 
 
 def append_conflict(prompt, completion_a, score_a, completion_b, score_b):
+    topic_priority = topic_priority_for(prompt)
     entry = {
         "prompt": prompt,
         "completions": [
             {"completion": completion_a, "score": score_a},
             {"completion": completion_b, "score": score_b},
         ],
+        "priority": topic_priority,
         "flagged_at": datetime.now().isoformat(),
     }
     with open(CONFLICT_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
-    print("   \u2697\ufe0f Conflict flagged \u2014 both completions saved to conflict_queue.jsonl")
+    print(f"   \u2697\ufe0f Conflict flagged (priority: {topic_priority}) \u2014 saved to conflict_queue.jsonl")
+
+
+def log_escalation(tier, count, user_input):
+    entry = {
+        "tier": tier,
+        "consecutive_low": count,
+        "user_input": user_input[:100],
+        "timestamp": datetime.now().isoformat(),
+    }
+    ESCALATION_EVENTS.append(entry)
+    with open(ESCALATION_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def show_escalation_stats():
+    if not os.path.exists(ESCALATION_LOG_PATH):
+        print("   No escalation events logged.")
+        return
+    tiers = Counter()
+    with open(ESCALATION_LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            tiers[entry.get("tier", "?")] += 1
+    print("   \U0001f4ca Escalation stats:")
+    for tier, count in tiers.most_common():
+        print(f"      Tier {tier}: {count} event(s)")
 
 
 def query_hash(query):
     return hashlib.sha256(query.strip().lower().encode()).hexdigest()[:16]
 
 
+def freshness_score(source, cached_at_str):
+    try:
+        age_days = (datetime.now() - datetime.fromisoformat(cached_at_str)).days
+    except Exception:
+        return 0
+    decay_rate = FRESHNESS_DECAY.get(source, 5)
+    return max(0, 100 - age_days * decay_rate)
+
+
 def cache_lookup(query):
     if not os.path.exists(CACHE_PATH):
         return None
     qh = query_hash(query)
-    now = datetime.now()
     fresh = []
     stale = []
     with open(CACHE_PATH, encoding="utf-8") as f:
@@ -113,20 +157,17 @@ def cache_lookup(query):
                 continue
             entry = json.loads(line)
             source = entry.get("source", "duckduckgo")
-            max_age = FRESHNESS_DAYS.get(source, 7)
-            cached_at = entry.get("cached_at", "")
-            try:
-                age = now - datetime.fromisoformat(cached_at)
-                if age > timedelta(days=max_age):
-                    stale.append(entry)
-                    continue
-            except Exception:
-                pass
-            fresh.append(entry)
+            fs = freshness_score(source, entry.get("cached_at", ""))
+            entry["_freshness"] = fs
+            if fs < FRESHNESS_STALE_AT:
+                stale.append(entry)
+            else:
+                fresh.append(entry)
     if stale:
         with open(CACHE_PATH, "w", encoding="utf-8") as f:
             for entry in fresh:
-                f.write(json.dumps(entry) + "\n")
+                e = {k: v for k, v in entry.items() if not k.startswith("_")}
+                f.write(json.dumps(e) + "\n")
     for entry in fresh:
         if entry.get("query_hash") == qh:
             return entry["results"]
@@ -192,6 +233,20 @@ def topic_distribution(data):
     return topics
 
 
+def topic_priority_for(text):
+    lower = text.lower()
+    for word in ["motivate", "inspire", "encourage", "push"]:
+        if word in lower:
+            return 90
+    for word in ["advise", "recommend", "suggest", "should"]:
+        if word in lower:
+            return 70
+    for word in ["explain", "what", "how", "define"]:
+        if word in lower:
+            return 50
+    return 30
+
+
 def detect_intent(user_input):
     lower = user_input.lower()
     if any(w in lower for w in ["motivate", "inspire", "encourage", "push", "hype"]):
@@ -201,6 +256,23 @@ def detect_intent(user_input):
     if any(w in lower for w in ["advise", "should i", "what should", "recommend", "suggest"]):
         return "advise"
     return None
+
+
+def normalize_weights(weights):
+    if not weights:
+        return
+    total = sum(weights.values())
+    if total == 0:
+        return
+    factor = 100 / total
+    for k in weights:
+        weights[k] = round(weights[k] * factor)
+
+
+def decay_weights(weights):
+    for k in weights:
+        if weights[k] > 50:
+            weights[k] = max(50, weights[k] - WEIGHT_DECAY_PER_TURN)
 
 
 def orchestrate_persona(spec, dynamic_overrides=None):
@@ -289,6 +361,27 @@ def dataset_stats(path=DATASET_PATH):
     if avg_conf is not None:
         print(f"   Recent avg confidence: {avg_conf:.0f}/100")
         print(f"   Consecutive low: {CONSECUTIVE_LOW}")
+    show_escalation_stats()
+
+
+def show_conflicts():
+    if not os.path.exists(CONFLICT_PATH):
+        print("   \u2705 No conflicts in queue.")
+        return
+    entries = []
+    with open(CONFLICT_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    entries.sort(key=lambda e: e.get("priority", 30), reverse=True)
+    print(f"   \u2697\ufe0f Conflict queue ({len(entries)} total, sorted by priority):")
+    for e in entries[:5]:
+        prompt_preview = e.get("prompt", "")[:60]
+        priority = e.get("priority", 30)
+        scores = [c.get("score", 0) for c in e.get("completions", [])]
+        print(f"      [{priority}] {prompt_preview}... scores={scores}")
 
 
 def validate_dataset(path=DATASET_PATH):
@@ -358,6 +451,8 @@ def sync_dataset(target_dir=None):
         files_to_sync.append(WEAK_REPLIES_PATH)
     if os.path.exists(CONFLICT_PATH):
         files_to_sync.append(CONFLICT_PATH)
+    if os.path.exists(ESCALATION_LOG_PATH):
+        files_to_sync.append(ESCALATION_LOG_PATH)
     snapshot = export_snapshot()
     if snapshot:
         files_to_sync.append(snapshot)
@@ -461,15 +556,18 @@ def layered_lookup(query):
 def apply_template(user_input, dynamic_weights=None):
     intent = detect_intent(user_input) if dynamic_weights is not None else None
     if intent and dynamic_weights is not None:
-        if intent == "motivate" and "coach" in dynamic_weights:
-            dynamic_weights["coach"] = min(dynamic_weights.get("coach", 50) + 15, 100)
-            dynamic_weights["mentor"] = max(dynamic_weights.get("mentor", 50) - 5, 10)
-            dynamic_weights["teacher"] = max(dynamic_weights.get("teacher", 0) - 5, 0)
+        decay_weights(dynamic_weights)
+        if intent == "motivate":
+            for name in ["coach", "mentor"]:
+                if name in dynamic_weights:
+                    dynamic_weights[name] = min(dynamic_weights.get(name, 50) + WEIGHT_BOOST_FACTOR, 100)
         elif intent == "explain" and "teacher" in dynamic_weights:
-            dynamic_weights["teacher"] = min(dynamic_weights.get("teacher", 50) + 15, 100)
+            dynamic_weights["teacher"] = min(dynamic_weights.get("teacher", 50) + WEIGHT_BOOST_FACTOR, 100)
         elif intent == "advise":
-            dynamic_weights["mentor"] = min(dynamic_weights.get("mentor", 50) + 10, 100)
-            dynamic_weights["coach"] = min(dynamic_weights.get("coach", 50) + 10, 100)
+            for name in ["mentor", "coach"]:
+                if name in dynamic_weights:
+                    dynamic_weights[name] = min(dynamic_weights.get(name, 50) + int(WEIGHT_BOOST_FACTOR * 0.8), 100)
+        normalize_weights(dynamic_weights)
     for key, template in PROMPT_TEMPLATES.items():
         if user_input.lower().startswith(key):
             return template.format(query=user_input[len(key):].strip())
@@ -526,12 +624,15 @@ Assistant: \"\"\"
 def handle_escalation_tier(count, user_input, prompt):
     if count >= 7:
         print(f"   \U0001f6d1 Tier 3 ({count} consecutive low) \u2014 hard fallback activated.")
+        log_escalation(3, count, user_input)
         return "I want to be honest with you \u2014 I\u2019m not confident I can give you a reliable answer right now. Let\u2019s try a different approach or topic."
     if count >= 5:
         print(f"   \U0001f6c8 Tier 2 ({count} consecutive low) \u2014 shifting persona to cautious mode.")
+        log_escalation(2, count, user_input)
         return None
     if count >= 3:
         print(f"   \U0001f310 Tier 1 ({count} consecutive low) \u2014 querying external sources.")
+        log_escalation(1, count, user_input)
         external_results = layered_lookup(user_input) if EXTERNAL_ENABLED else []
         if external_results:
             parts = [f"[{source}] {text}" for source, text in external_results]
@@ -560,9 +661,9 @@ def chat_with_feeling(persona_name="mentor"):
 
     print(f"\U0001f4a1 Emotional Ollama Chat Started  [persona: {persona_name}]")
     print(f"   Model: {MODEL_VERSION}  |  Dataset: {DATASET_PATH}")
-    print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold")
+    print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate | gold | conflicts")
     if EXTERNAL_ENABLED:
-        print(f"   \U0001f310 External knowledge: {', '.join(EXTERNAL_SOURCES)}")
+        print(f"   \U0001f310 External: {', '.join(EXTERNAL_SOURCES)} | Cache freshness score < {FRESHNESS_STALE_AT} = stale")
         print(f"   Escalation tiers: 3\u2192external  5\u2192persona shift  7\u2192hard fallback")
     try:
         while True:
@@ -592,6 +693,10 @@ def chat_with_feeling(persona_name="mentor"):
                 export_gold_dataset()
                 continue
 
+            if cmd == "conflicts":
+                show_conflicts()
+                continue
+
             if cmd.startswith("correct") and LAST_REPLY is not None:
                 corrected = user_input[len("correct"):].strip()
                 if corrected:
@@ -605,7 +710,7 @@ def chat_with_feeling(persona_name="mentor"):
             prompt = apply_template(user_input, DYNAMIC_WEIGHTS)
             if DYNAMIC_WEIGHTS and "+" in persona_name:
                 active_persona = build_persona(data, persona_name, DYNAMIC_WEIGHTS)
-                print(f"   \U0001f504 Dynamic weights: {DYNAMIC_WEIGHTS}")
+                print(f"   \U0001f504 Weights: {DYNAMIC_WEIGHTS}")
 
             try:
                 response = ollama.chat(
@@ -692,6 +797,9 @@ if __name__ == "__main__":
             i += 2
         elif arg == "--federated-sync" and i + 1 < len(sys.argv):
             federated_sync(sys.argv[i + 1], merge_policy)
+            sys.exit(0)
+        elif arg == "--conflicts":
+            show_conflicts()
             sys.exit(0)
         else:
             rest.append(arg)

@@ -2,17 +2,25 @@ import ollama
 import json
 import os
 import sys
+import shutil
+import urllib.request
+import urllib.parse
+from datetime import datetime
 from collections import Counter
 
 MODEL_VERSION = "llama3.2"
 DATASET_PATH = "curated_dataset.jsonl"
 WEAK_REPLIES_PATH = "weak_replies.jsonl"
+SNAPSHOT_DIR = "snapshots"
 SCORE_THRESHOLD = 70
 LAST_REPLY = None
 LAST_PROMPT = None
 LAST_SCORE = None
 
-PERSONA = f"""
+EXTERNAL_SEARCH_URL = "https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
+EXTERNAL_ENABLED = False  # set True and configure SEARCH_URL for live lookups
+
+PERSONA_BASE = f"""
 You are a warm, empathetic mentor.
 Always respond with encouragement, positivity, and emotional awareness.
 Use supportive language, motivational tone, and show understanding.
@@ -78,7 +86,11 @@ def score_reply(reply):
     return max(score, 0)
 
 
-def topic_balance(data):
+def score_completion(completion):
+    return score_reply(completion)
+
+
+def topic_distribution(data):
     prompts = [d["prompt"] for d in data]
     topics = Counter()
     for p in prompts:
@@ -88,6 +100,28 @@ def topic_balance(data):
                 break
         else:
             topics["general"] += 1
+    return topics
+
+
+def build_persona(data=None):
+    persona = PERSONA_BASE
+    if data and len(data) >= 3:
+        topics = topic_distribution(data)
+        total = sum(topics.values()) or 1
+        motivated_share = topics.get("motivate", 0) / total
+        advise_share = topics.get("advise", 0) / total
+        explain_share = topics.get("explain", 0) / total
+        if motivated_share < 0.2:
+            persona += "\nEmphasize motivation and encouragement in your responses."
+        if advise_share < 0.2:
+            persona += "\nActively offer actionable advice and guidance."
+        if explain_share > 0.5:
+            persona += "\nPrioritize clarity and simplicity in explanations."
+    return persona
+
+
+def topic_balance(data):
+    topics = topic_distribution(data)
     if not topics:
         return topics
     total = sum(topics.values())
@@ -133,18 +167,47 @@ def validate_dataset(path=DATASET_PATH):
         print(f"⚠️  {issues} issue(s) found. Consider reviewing.")
 
 
-def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="empathetic-mentor"):
+def export_snapshot(path=DATASET_PATH):
+    if not os.path.exists(path):
+        print("⚠️  No dataset to snapshot.")
+        return
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_path = os.path.join(SNAPSHOT_DIR, f"curated_{timestamp}.jsonl")
+    shutil.copy2(path, snapshot_path)
+    print(f"📸 Snapshot saved: {snapshot_path}")
+    return snapshot_path
+
+
+def train_from_dataset(base_model=MODEL_VERSION, path=DATASET_PATH, new_model="empathetic-mentor", min_score=80):
     data = load_dataset(path)
     if len(data) < 5:
         print("⚠️  Need at least 5 dataset entries to train.")
         return
-    print(f"🧠 Training '{new_model}' from {base_model} using {len(data)} examples...")
+
+    scored = []
+    for entry in data:
+        s = score_completion(entry["completion"])
+        entry["_score"] = s
+        scored.append(entry)
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    high_quality = [e for e in scored if e["_score"] >= min_score]
+    if not high_quality:
+        print(f"⚠️  No entries scored >= {min_score}. Training with top entries anyway.")
+        high_quality = scored[:10]
+
+    export_snapshot(path)
+    print(f"🧠 Training '{new_model}' from {base_model} using {len(high_quality)} high-quality examples (score >= {min_score})...")
+
     few_shot = ""
-    for i, entry in enumerate(data[:20]):
+    for entry in high_quality[:20]:
         few_shot += f"User: {entry['prompt']}\nAssistant: {entry['completion']}\n\n"
+
+    data = load_dataset(path)
+    persona = build_persona(data)
     modelfile = f"""FROM {base_model}
-SYSTEM \"\"\"{PERSONA.strip()}\"\"\"
-TEMPLATE \"\"\"System: {PERSONA.strip()}
+SYSTEM \"\"\"{persona.strip()}\"\"\"
+TEMPLATE \"\"\"System: {persona.strip()}
 
 {few_shot}
 User: {{.Prompt}}
@@ -163,6 +226,25 @@ Assistant: \"\"\"
             os.remove(modelfile_path)
 
 
+def external_lookup(query):
+    if not EXTERNAL_ENABLED:
+        return None
+    try:
+        url = EXTERNAL_SEARCH_URL.format(query=urllib.parse.quote(query))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            abstract = data.get("AbstractText", "")
+            if abstract:
+                return abstract
+            results = data.get("RelatedTopics", [])
+            if results:
+                return results[0].get("Text", None)
+    except Exception:
+        pass
+    return None
+
+
 def apply_template(user_input):
     for key, template in PROMPT_TEMPLATES.items():
         if user_input.lower().startswith(key):
@@ -173,9 +255,15 @@ def apply_template(user_input):
 def chat_with_feeling():
     global LAST_REPLY, LAST_PROMPT, LAST_SCORE
 
+    data = load_dataset()
+    persona = build_persona(data)
+    active_persona = persona
+
     print("💡 Emotional Ollama Chat Started")
     print(f"   Model: {MODEL_VERSION}  |  Dataset: {DATASET_PATH}")
     print("   Commands:  exit/quit  |  99 (connect)  |  correct <new text>  |  stats  |  validate")
+    if EXTERNAL_ENABLED:
+        print("   🌐 External knowledge fallback is ON")
     try:
         while True:
             user_input = input("You: ")
@@ -187,6 +275,9 @@ def chat_with_feeling():
 
             if cmd == "99":
                 print("📞 Connecting to your empathetic AI assistant...")
+                data = load_dataset()
+                active_persona = build_persona(data)
+                print("   Persona adapted to current dataset distribution.")
                 continue
 
             if cmd == "stats":
@@ -212,7 +303,7 @@ def chat_with_feeling():
                 response = ollama.chat(
                     model=MODEL_VERSION,
                     messages=[
-                        {"role": "system", "content": PERSONA},
+                        {"role": "system", "content": active_persona},
                         {"role": "user", "content": prompt},
                     ],
                 )
@@ -226,9 +317,15 @@ def chat_with_feeling():
 
                 if score < 50:
                     append_to_weak(prompt, reply, score)
-                    print(f"⚠️  Score {score}/100 — auto-rejected. Using fallback.")
-                    print("Ollama:", FALLBACK)
-                    append_to_dataset(prompt, FALLBACK)
+                    external = external_lookup(user_input)
+                    if external:
+                        fallback_reply = f"I checked an external source: {external}"
+                        print(f"   🌐 External result: {fallback_reply}")
+                        append_to_dataset(prompt, fallback_reply)
+                    else:
+                        print(f"⚠️  Score {score}/100 — auto-rejected. Using fallback.")
+                        print("Ollama:", FALLBACK)
+                        append_to_dataset(prompt, FALLBACK)
                 elif score < SCORE_THRESHOLD:
                     append_to_weak(prompt, reply, score)
                     print(f"⚠️  Reply scored {score}/100 — below threshold.")
